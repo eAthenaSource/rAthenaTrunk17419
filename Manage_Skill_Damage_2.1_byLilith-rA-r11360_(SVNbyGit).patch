@@ -1,0 +1,160 @@
+Index: db/skill_damage_db.txt
+===================================================================
+--- db/skill_damage_db.txt	(revision 0)
++++ db/skill_damage_db.txt	(working copy)
+@@ -0,0 +1,21 @@
++// Manage skill damage [Lilith]
++// Format: Skill ID, Mode, Damage against Players{, Damage against Mobs{, Damage against Bosses{, Damage against Other}}}
++// Mode
++// 1    - restricted in normal maps
++// 2    - restricted in PVP
++// 4    - restricted in GVG
++// 8    - restricted in Battlegrounds
++// Restricted zones - they're configured by 'restricted <number>' mapflag
++// 32   - restricted in zone 1
++// 64   - restricted in zone 2
++// 128  - restricted in zone 3
++// 256  - restricted in zone 4
++// 512  - restricted in zone 5
++// 1024 - restricted in zone 6
++// 2048 - restricted in zone 7
++//
++// Examples:
++// Mammonite: Normal maps, +50% against players, nothing else.
++// 42,1,50
++// Adoramus: PvP & GvG maps, +50% against players, +0% against mobs, +10% against boss monsters, +15% against others
++// 2040,6,50,0,10,15
+\ No newline at end of file
+Index: src/map/battle.c
+===================================================================
+--- src/map/battle.c	(revision 11360)
++++ src/map/battle.c	(working copy)
+@@ -1732,6 +1732,40 @@
+ 	return 0;
+ }
+ 
++/*==========================================
++ * Manage Skill Damage [Lilith]
++ *------------------------------------------*/
++static int battle_SAD(struct map_session_data *sd, struct block_list *target, uint16 skill_id)
++{
++	int dmg = 0;
++
++	if((skill_db[skill_id].flag&1 && !map_flag_vs(sd->bl.m)) ||
++		(skill_db[skill_id].flag&2 && map[sd->bl.m].flag.pvp) ||
++		(skill_db[skill_id].flag&4 && map_flag_gvg(sd->bl.m)) ||
++		(skill_db[skill_id].flag&8 && map[sd->bl.m].flag.battleground) ||
++		(map[sd->bl.m].flag.restricted && skill_db[skill_id].flag&(8*map[sd->bl.m].zone)))
++	{
++		
++		switch(target->type)
++		{
++			case BL_PC:
++				dmg = skill_db[skill_id].pc_damage;
++				break;
++			case BL_MOB:
++				if(((TBL_MOB*)target)->status.mode&MD_BOSS)
++					dmg = skill_db[skill_id].boss_damage;
++				else
++					dmg = skill_db[skill_id].mob_damage;
++				break;
++			default:
++				dmg = skill_db[skill_id].other_damage;
++				break;
++		}
++	}
++		
++	return dmg;
++}
++
+ struct Damage battle_calc_magic_attack(struct block_list *src,struct block_list *target,uint16 skill_id,uint16 skill_lv,int mflag);
+ struct Damage battle_calc_misc_attack(struct block_list *src,struct block_list *target,uint16 skill_id,uint16 skill_lv,int mflag);
+ 
+@@ -4368,6 +4402,7 @@
+ 
+ 	if(sd)
+ 	{
++		ATK_ADDRATE(wd.damage, wd.damage2, battle_SAD(sd, target, skill_id)); // Manage Skill Damage [Lilith]
+ 		if (skill_id != CR_SHIELDBOOMERANG) //Only Shield boomerang doesn't takes the Star Crumbs bonus.
+ 			ATK_ADD2(wd.damage, wd.damage2, wd.div_*sd->right_weapon.star, wd.div_*sd->left_weapon.star);
+ 		if (skill_id==MO_FINGEROFFENSIVE) { //The finger offensive spheres on moment of attack do count. [Skotlex]
+@@ -4996,6 +5031,8 @@
+ 		}
+ #endif
+ 		if(sd) {
++			MATK_ADDRATE(battle_SAD(sd, target, skill_id)); // Manage Skill Damage [Lilith]
++
+ 			//Damage bonuses
+ 			if ((i = pc_skillatk_bonus(sd, skill_id)))
+ 				ad.damage += (int64)ad.damage*i/100;
+@@ -5449,8 +5486,11 @@
+ 
+ 	md.damage +=  battle_calc_cardfix(BF_MISC, src, target, nk, s_ele, 0, md.damage, 0, md.flag);
+ 
+-	if (sd && (i = pc_skillatk_bonus(sd, skill_id)))
+-		md.damage += (int64)md.damage*i/100;
++	if (sd) {
++		if ((i = pc_skillatk_bonus(sd, skill_id)))
++			md.damage += (int64)md.damage*i/100;
++		md.damage += (int64)md.damage * battle_SAD(sd, target, skill_id) / 100; // Manage Skill Damage [Lilith]
++	}
+ 
+ 	if(md.damage < 0)
+ 		md.damage = 0;
+Index: src/map/skill.c
+===================================================================
+--- src/map/skill.c	(revision 11360)
++++ src/map/skill.c	(working copy)
+@@ -17983,6 +17983,28 @@
+ }
+ 
+ /*==========================================
++ * Manage Skill Damage [Lilith]
++ *------------------------------------------*/
++static bool skill_parse_row_skilldamage(char* split[], int columns, int current)
++{
++	uint16 skill_id = atoi(split[0]);
++	uint16 idx;
++	if( !(idx = skill_get_index(skill_id)) ) // invalid skill id
++		return false;
++		
++	skill_db[idx].flag					|= atoi(split[1]);
++	skill_db[idx].pc_damage				= atoi(split[2]);
++	if(split[3])
++		skill_db[idx].mob_damage		= atoi(split[3]);
++	if(split[4])
++		skill_db[idx].boss_damage		= atoi(split[4]);
++	if(split[5])
++		skill_db[idx].other_damage		= atoi(split[5]);
++
++	return true;
++}
++
++/*==========================================
+  * sub-function of DB reading.
+  * skill_db.txt
+  *------------------------------------------*/
+@@ -18427,6 +18449,8 @@
+ 	sv_readdb(db_path, "skill_reproduce_db.txt", ',',   1,  1, MAX_SKILL_DB, skill_parse_row_reproducedb);
+ 	sv_readdb(db_path, "skill_improvise_db.txt"      , ',',   2,  2, MAX_SKILL_IMPROVISE_DB, skill_parse_row_improvisedb);
+ 	sv_readdb(db_path, "skill_changematerial_db.txt"      , ',',   4,  4+2*5, MAX_SKILL_PRODUCE_DB, skill_parse_row_changematerialdb);
++	// Manage Skill Damage [Lilith]
++	sv_readdb(db_path, "skill_damage_db.txt"      , ',',   3,  6, MAX_SKILL_DB, skill_parse_row_skilldamage);
+ 
+ }
+ 
+Index: src/map/skill.h
+===================================================================
+--- src/map/skill.h	(revision 11360)
++++ src/map/skill.h	(working copy)
+@@ -112,6 +112,10 @@
+ 	int unit_interval;
+ 	int unit_target;
+ 	int unit_flag;
++	
++	// Manage Skill Damage [Lilith]
++	short flag;
++	int pc_damage,mob_damage,other_damage,boss_damage;
+ };
+ extern struct s_skill_db skill_db[MAX_SKILL_DB];
+ 
